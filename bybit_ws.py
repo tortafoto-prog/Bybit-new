@@ -53,6 +53,7 @@ class BybitWebSocket:
         self._ws = None
         self._running = False
         self._reconnects = 0
+        self._last_msg = 0.0
 
     def _sign(self) -> tuple[int, str]:
         expires = int((time.time() + 5) * 1000)
@@ -77,26 +78,31 @@ class BybitWebSocket:
         log.info(f"[{self.account_name}] Subscribed to {TOPICS}")
 
     async def _heartbeat(self):
+        """Bybit V5 expects an application-level {"op":"ping"} every 20s and
+        replies {"op":"pong"}. We send that and treat the connection as dead
+        only if no message (pong or data) arrives for a while — protocol-level
+        ping/pong is unreliable on Bybit and caused spurious reconnects."""
+        dead_after = WS_PING_INTERVAL_S + WS_PONG_TIMEOUT_S + 30
         while self._running and self._ws:
             try:
                 await asyncio.sleep(WS_PING_INTERVAL_S)
-                if self._ws and self._ws.open:
-                    pong = await asyncio.wait_for(self._ws.ping(), timeout=WS_PONG_TIMEOUT_S)
-                    await pong
-            except (asyncio.TimeoutError, ConnectionClosed):
-                log.warning(f"[{self.account_name}] Heartbeat failed → reconnect")
-                if self._ws:
+                if not (self._ws and self._ws.open):
+                    break
+                await self._ws.send(json.dumps({"op": "ping"}))
+                if self._last_msg and (time.time() - self._last_msg) > dead_after:
+                    log.warning(f"[{self.account_name}] No messages for {dead_after}s → reconnect")
                     await self._ws.close()
-                break
-            except Exception as e:
-                log.error(f"[{self.account_name}] Heartbeat error: {e}")
+                    break
+            except (ConnectionClosed, Exception) as e:
+                log.warning(f"[{self.account_name}] Heartbeat stopped: {e}")
                 break
 
     async def _recv_loop(self):
         while self._running and self._ws:
             try:
                 data = json.loads(await self._ws.recv())
-                if data.get("op") in ("pong", "subscribe", "auth"):
+                self._last_msg = time.time()
+                if data.get("op") in ("pong", "ping", "subscribe", "auth"):
                     continue
                 if self.on_message and "topic" in data:
                     try:
@@ -119,6 +125,7 @@ class BybitWebSocket:
                 await self._authenticate()
                 await self._subscribe()
                 self._reconnects = 0
+                self._last_msg = time.time()
                 if self.on_connect:
                     await self.on_connect()
 

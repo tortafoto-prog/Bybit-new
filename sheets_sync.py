@@ -152,12 +152,15 @@ class SheetsSync:
                     if eid:
                         state.seen_exec_ids.add(eid)
 
+        from constants import PositionMode
+        hedge = state.position_mode == PositionMode.HEDGE
+
         loaded = 0
         for trade_id, (row, row_num) in open_rows.items():
             if g(row, _C_ACCOUNT) != account_name:
                 continue
             try:
-                trade = open_row_to_trade(row, row_num)
+                trade = open_row_to_trade(row, row_num, hedge=hedge)
             except Exception as e:
                 log.error(f"[{account_name}] Bad OPEN row {row_num}: {e}")
                 continue

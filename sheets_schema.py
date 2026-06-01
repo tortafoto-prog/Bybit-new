@@ -123,12 +123,22 @@ def _to_ms(s: str) -> int:
     return 0
 
 
-def open_row_to_trade(row: list, row_number: int) -> InternalTrade:
-    """Reconstruct a still-open trade from its OPEN sheet row."""
+def open_row_to_trade(row: list, row_number: int, hedge: bool = False) -> InternalTrade:
+    """Reconstruct a still-open trade from its OPEN sheet row.
+
+    The sheet has no positionIdx column, so in hedge mode we infer it from the
+    side (Buy→1 long, Sell→2 short); otherwise it is 0. Getting this right is
+    essential — exit fills are matched by symbol+positionIdx, so a wrong idx
+    leaves the close "unmatched" and the trade never gets a CLOSE row.
+    """
     def g(i: int) -> str:
         return str(row[i]).strip() if i < len(row) and row[i] is not None else ""
 
     side = "Buy" if g(3).upper() == "BUY" else "Sell"
+    if hedge:
+        position_idx = 1 if side == "Buy" else 2
+    else:
+        position_idx = 0
     sl = _f(g(7))
     tp = _f(g(8))
     return InternalTrade(
@@ -136,7 +146,7 @@ def open_row_to_trade(row: list, row_number: int) -> InternalTrade:
         account_name=g(1),
         symbol=g(2),
         side=side,
-        position_idx=0,
+        position_idx=position_idx,
         entry_price=_f(g(4)),
         entry_qty=_f(g(5)),
         entry_time_ms=_to_ms(g(0)),
