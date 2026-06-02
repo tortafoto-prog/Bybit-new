@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="hu">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Realtime-szerű él chart (replay)</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --grid: #21262d;
+    --text: #c9d1d9;
+    --muted: #8b949e;
+    --up: #26a69a;
+    --down: #ef5350;
+    --line: #58a6ff;
+    --accent: #f0b90b; /* Bybit/Binance sárga */
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    padding: 20px;
+  }
+  h1 { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 16px; }
+  .wrap {
+    max-width: 980px;
+    margin: 0 auto;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--grid);
+    border-radius: 10px;
+    padding: 16px;
+  }
+  .toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: center;
+    margin-bottom: 14px;
+  }
+  button {
+    background: #21262d;
+    color: var(--text);
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    padding: 8px 14px;
+    font-size: 13px;
+    cursor: pointer;
+    transition: background .15s;
+  }
+  button:hover { background: #30363d; }
+  button.primary {
+    background: var(--accent);
+    color: #1a1a1a;
+    border-color: var(--accent);
+    font-weight: 600;
+  }
+  button.primary:hover { filter: brightness(1.08); }
+  label { font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  input[type=range] { accent-color: var(--accent); }
+  .stats {
+    display: flex;
+    gap: 24px;
+    margin-bottom: 12px;
+    flex-wrap: wrap;
+  }
+  .stat .k { font-size: 12px; color: var(--muted); }
+  .stat .v { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .v.up { color: var(--up); }
+  .v.down { color: var(--down); }
+  canvas { width: 100%; height: auto; display: block; border-radius: 6px; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 12px; line-height: 1.5; }
+  code { background: #0d1117; padding: 1px 5px; border-radius: 4px; color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Realtime-szerű él chart <span style="color:var(--muted);font-weight:400">(adatpontok lejátszása)</span></h1>
+  <div class="sub">Az adatpontok már megvannak — az időzítő pontonként „lejátssza" őket, így úgy fejlődik, mintha élőben érkezne.</div>
+
+  <div class="card">
+    <div class="stats">
+      <div class="stat"><div class="k">Utolsó ár</div><div class="v" id="lastVal">—</div></div>
+      <div class="stat"><div class="k">Változás</div><div class="v" id="chgVal">—</div></div>
+      <div class="stat"><div class="k">Pont</div><div class="v" id="idxVal">0 / 0</div></div>
+    </div>
+
+    <canvas id="chart" width="940" height="420"></canvas>
+
+    <div class="toolbar" style="margin-top:14px">
+      <button class="primary" id="playBtn">▶ Lejátszás</button>
+      <button id="restartBtn">⟲ Újra</button>
+      <label>Sebesség
+        <input type="range" id="speed" min="1" max="60" value="20">
+        <span id="speedVal" style="color:var(--text)">20×</span>
+      </label>
+      <label><input type="checkbox" id="loopChk"> ismétlés</label>
+    </div>
+
+    <div class="hint">
+      Saját adat: cseréld a <code>DATA</code> tömböt a fájl alján <code>{t, v}</code> pontokra
+      (t = idő/címke, v = érték), vagy hívd a <code>loadData([...])</code> függvényt.
+      A Bybit botból pl. a kline/PnL pontjait írhatod ide JSON-ként.
+    </div>
+  </div>
+</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('chart');
+  const ctx = canvas.getContext('2d');
+  const DPR = window.devicePixelRatio || 1;
+
+  // --- állapot ---
+  let data = [];          // teljes adatsor: {t, v}
+  let shown = 0;          // hány pont látszik már
+  let playing = false;
+  let acc = 0, lastTs = 0;
+  let pointsPerSec = 20;  // sebesség
+
+  const els = {
+    last: document.getElementById('lastVal'),
+    chg:  document.getElementById('chgVal'),
+    idx:  document.getElementById('idxVal'),
+    play: document.getElementById('playBtn'),
+    restart: document.getElementById('restartBtn'),
+    speed: document.getElementById('speed'),
+    speedVal: document.getElementById('speedVal'),
+    loop: document.getElementById('loopChk'),
+  };
+
+  // HiDPI vászon
+  function fitCanvas() {
+    const cssW = canvas.clientWidth || 940;
+    const cssH = cssW * (420 / 940);
+    canvas.width = Math.round(cssW * DPR);
+    canvas.height = Math.round(cssH * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    return { w: cssW, h: cssH };
+  }
+
+  function niceColor(start, end) {
+    return end >= start ? getCss('--up') : getCss('--down');
+  }
+  function getCss(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+
+  function draw() {
+    const { w, h } = fitCanvas();
+    ctx.clearRect(0, 0, w, h);
+
+    const padL = 60, padR = 16, padT = 16, padB = 28;
+    const plotW = w - padL - padR;
+    const plotH = h - padT - padB;
+
+    if (data.length === 0) return;
+
+    const vis = data.slice(0, Math.max(shown, 1));
+
+    // tartomány a TELJES adatra (hogy a tengely ne ugráljon) — élethűbb, ha a látszóra skálázunk:
+    const scaleSet = vis;
+    let min = Infinity, max = -Infinity;
+    for (const p of scaleSet) { if (p.v < min) min = p.v; if (p.v > max) max = p.v; }
+    if (min === max) { min -= 1; max += 1; }
+    const range = max - min;
+    min -= range * 0.08; max += range * 0.08;
+
+    const n = data.length;
+    const xAt = i => padL + (n <= 1 ? plotW / 2 : (i / (n - 1)) * plotW);
+    const yAt = v => padT + plotH - ((v - min) / (max - min)) * plotH;
+
+    // rács + y címkék
+    ctx.font = '11px sans-serif';
+    ctx.textBaseline = 'middle';
+    ctx.strokeStyle = getCss('--grid');
+    ctx.fillStyle = getCss('--muted');
+    ctx.lineWidth = 1;
+    const rows = 5;
+    for (let r = 0; r <= rows; r++) {
+      const val = min + (r / rows) * (max - min);
+      const y = yAt(val);
+      ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(w - padR, y); ctx.stroke();
+      ctx.textAlign = 'right';
+      ctx.fillText(formatNum(val), padL - 8, y);
+    }
+
+    // vonal
+    const startV = vis[0].v, endV = vis[vis.length - 1].v;
+    const col = niceColor(startV, endV);
+
+    // területkitöltés
+    const grad = ctx.createLinearGradient(0, padT, 0, padT + plotH);
+    grad.addColorStop(0, hexA(col, 0.28));
+    grad.addColorStop(1, hexA(col, 0.0));
+    ctx.beginPath();
+    ctx.moveTo(xAt(0), yAt(vis[0].v));
+    for (let i = 1; i < vis.length; i++) ctx.lineTo(xAt(i), yAt(vis[i].v));
+    ctx.lineTo(xAt(vis.length - 1), padT + plotH);
+    ctx.lineTo(xAt(0), padT + plotH);
+    ctx.closePath();
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // maga a vonal
+    ctx.beginPath();
+    ctx.moveTo(xAt(0), yAt(vis[0].v));
+    for (let i = 1; i < vis.length; i++) ctx.lineTo(xAt(i), yAt(vis[i].v));
+    ctx.strokeStyle = col;
+    ctx.lineWidth = 2;
+    ctx.lineJoin = 'round';
+    ctx.stroke();
+
+    // pulzáló pont a végén (live jelző)
+    const lx = xAt(vis.length - 1), ly = yAt(endV);
+    const pulse = 4 + 2 * Math.abs(Math.sin(performance.now() / 300));
+    ctx.beginPath();
+    ctx.fillStyle = hexA(col, 0.25);
+    ctx.arc(lx, ly, pulse + 4, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath();
+    ctx.fillStyle = col;
+    ctx.arc(lx, ly, 4, 0, Math.PI * 2); ctx.fill();
+
+    // szaggatott vízszintes vonal az utolsó értéknél
+    ctx.setLineDash([4, 4]);
+    ctx.strokeStyle = hexA(col, 0.5);
+    ctx.beginPath(); ctx.moveTo(padL, ly); ctx.lineTo(lx, ly); ctx.stroke();
+    ctx.setLineDash([]);
+
+    updateStats(startV, endV);
+  }
+
+  function updateStats(startV, endV) {
+    els.last.textContent = formatNum(endV);
+    const chg = endV - startV;
+    const pct = startV !== 0 ? (chg / Math.abs(startV)) * 100 : 0;
+    els.chg.textContent = (chg >= 0 ? '+' : '') + formatNum(chg) + '  (' + (pct >= 0 ? '+' : '') + pct.toFixed(2) + '%)';
+    els.chg.className = 'v ' + (chg >= 0 ? 'up' : 'down');
+    els.last.className = 'v ' + (chg >= 0 ? 'up' : 'down');
+    els.idx.textContent = shown + ' / ' + data.length;
+  }
+
+  function formatNum(v) {
+    const a = Math.abs(v);
+    if (a >= 1000) return v.toLocaleString('hu-HU', { maximumFractionDigits: 1 });
+    if (a >= 1) return v.toFixed(2);
+    return v.toFixed(4);
+  }
+  function hexA(hex, a) {
+    hex = hex.replace('#', '');
+    if (hex.length === 3) hex = hex.split('').map(c => c + c).join('');
+    const r = parseInt(hex.slice(0,2),16), g = parseInt(hex.slice(2,4),16), b = parseInt(hex.slice(4,6),16);
+    return `rgba(${r},${g},${b},${a})`;
+  }
+
+  // --- animáció: pontonkénti "lejátszás" ---
+  function tick(ts) {
+    if (!lastTs) lastTs = ts;
+    const dt = (ts - lastTs) / 1000;
+    lastTs = ts;
+
+    if (playing) {
+      acc += dt * pointsPerSec;
+      while (acc >= 1 && shown < data.length) {
+        shown++;
+        acc -= 1;
+      }
+      if (shown >= data.length) {
+        if (els.loop.checked) { shown = 0; acc = 0; }
+        else { stop(); }
+      }
+    }
+    draw();
+    requestAnimationFrame(tick);
+  }
+
+  function play() {
+    if (shown >= data.length) shown = 0;
+    playing = true; lastTs = 0;
+    els.play.textContent = '⏸ Szünet';
+  }
+  function stop() {
+    playing = false;
+    els.play.textContent = (shown >= data.length) ? '▶ Újra' : '▶ Folytatás';
+  }
+
+  // --- vezérlők ---
+  els.play.addEventListener('click', () => playing ? stop() : play());
+  els.restart.addEventListener('click', () => { shown = 0; acc = 0; play(); });
+  els.speed.addEventListener('input', () => {
+    pointsPerSec = +els.speed.value;
+    els.speedVal.textContent = pointsPerSec + '×';
+  });
+  window.addEventListener('resize', draw);
+
+  // --- adat betöltés API ---
+  // p lehet: {t, v}  vagy  szám (auto index)  vagy  [t, v]
+  window.loadData = function (arr) {
+    data = arr.map((p, i) => {
+      if (typeof p === 'number') return { t: i, v: p };
+      if (Array.isArray(p)) return { t: p[0], v: p[1] };
+      return { t: p.t ?? i, v: p.v };
+    });
+    shown = 0; acc = 0;
+    draw();
+  };
+
+  // ====== ITT cseréld a saját adataidra ======
+  // Demó: véletlenszerű "árfolyam" séta 300 ponton.
+  function demoSeries(n, start) {
+    const out = [];
+    let v = start;
+    for (let i = 0; i < n; i++) {
+      v += (Math.random() - 0.49) * (start * 0.012);
+      out.push({ t: i, v: Math.max(v, start * 0.2) });
+    }
+    return out;
+  }
+  const DATA = demoSeries(300, 65000); // pl. BTC-szerű árfolyam
+  loadData(DATA);
+  requestAnimationFrame(tick);
+  play(); // induljon rögtön
+})();
+</script>
+</body>
+</html>
