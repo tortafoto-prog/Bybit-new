@@ -62,6 +62,15 @@ class SheetsClient:
         elif len(existing) < len(HEADERS):
             log.warning(f"Sheets: header has {len(existing)} cols, expected {len(HEADERS)}")
 
+        # Diagnostic: how many real data rows are there, vs. where does an
+        # append land? A big difference means trailing blank/junk rows are
+        # pushing appends far below the visible data.
+        try:
+            col_a = self._ws.col_values(1)
+            log.info(f"Sheets: column A last non-empty row = {len(col_a)}")
+        except Exception:
+            pass
+
         # Write self-test: append + delete a probe row so a permission problem
         # surfaces here rather than silently dropping every trade.
         try:
@@ -70,6 +79,7 @@ class SheetsClient:
                 value_input_option="USER_ENTERED", table_range="A1")
             rng = probe.get("updates", {}).get("updatedRange", "")
             row = _row_from_range(rng)
+            log.info(f"Sheets: append self-test landed at row {row}")
             if row:
                 self._ws.delete_rows(row)
             self.can_write = True
