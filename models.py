@@ -131,8 +131,8 @@ class InternalTrade:
 
     # Bookkeeping
     grace_deadline_ms: Optional[int] = None
-    sheets_open_row: Optional[int] = None
-    sheets_close_row: Optional[int] = None
+    open_posted: bool = False       # OPEN row sent to doPost
+    close_posted: bool = False      # CLOSE row sent to doPost
     created_at_ms: int = field(default_factory=lambda: int(time.time() * 1000))
     updated_at_ms: int = field(default_factory=lambda: int(time.time() * 1000))
 

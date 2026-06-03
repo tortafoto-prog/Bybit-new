@@ -1,45 +1,46 @@
 """Offline end-to-end smoke test (no network). Run: python selftest.py
 
-Exercises the real engine, SL tracker and sheets sync against an in-memory fake
-Sheets client to verify the full write path and hedge-mode close matching.
+Exercises the real engine, SL tracker and journal against a fake doPost client
+that records the posted payloads — verifying the full flow and that OPEN is
+posted only when the SL status is settled.
 """
 
 import asyncio
+import time
 
 from constants import PositionMode, TradeStatus, ExitType
 from models import AccountState
 from sl_tracker import SLTracker
 from trade_engine import TradeEngine
-from sheets_sync import SheetsSync
+from journal import Journal
 from fills import parse_fill_ws
 from handlers import OrderHandler
+import constants
 
 
-class FakeClient:
+class FakeDoPost:
     def __init__(self):
-        self.rows = []          # appended rows
-        self.updates = {}       # row_number -> row
+        self.posts = []  # list of payloads
 
-    async def append_row(self, values):
-        self.rows.append(values)
-        return len(self.rows) + 1   # pretend header is row 1
-
-    async def update_row(self, row_number, values):
-        self.updates[row_number] = values
-
-    async def get_all_rows(self):
-        return []
+    async def post(self, payload):
+        self.posts.append(payload)
+        return {"status": "success", "sync": "ok"}
 
 
-def fill(side, qty, price, closed=0.0, idx=0, exec_id="e", order_id="o",
-         t=1_000, stop=""):
-    return {
-        "execId": exec_id, "orderId": order_id, "symbol": "ETHUSDT",
-        "side": side, "execPrice": str(price), "execQty": str(qty),
-        "execFee": "0", "execTime": str(t), "execType": "Trade",
-        "positionIdx": str(idx), "closedSize": str(closed),
-        "orderType": "Market", "stopOrderType": stop,
-    }
+_NOW = int(time.time() * 1000)
+
+
+def fill(side, qty, price, closed=0.0, idx=0, exec_id="e", order_id="o", t=None, stop=""):
+    # Realistic epoch-ms exec time so the grace deadline lands ~now+60s.
+    t = _NOW if t is None else t
+    return {"execId": exec_id, "orderId": order_id, "symbol": "ETHUSDT", "side": side,
+            "execPrice": str(price), "execQty": str(qty), "execFee": "0",
+            "execTime": str(t), "execType": "Trade", "positionIdx": str(idx),
+            "closedSize": str(closed), "orderType": "Market", "stopOrderType": stop}
+
+
+async def settle():
+    await asyncio.sleep(0.05)
 
 
 async def run():
@@ -50,83 +51,65 @@ async def run():
         if not cond:
             failures.append(name)
 
-    # ── Scenario: hedge SHORT, open → SL set → close (the previously broken path)
-    client = FakeClient()
-    sheets = SheetsSync(client)
-    await sheets.start()
+    # ── Scenario A: hedge SHORT, open → SL → close ──────────────────────────
+    fake = FakeDoPost()
+    journal = Journal(fake)
+    await journal.start()
     state = AccountState("Béla teszt", PositionMode.HEDGE)
-    sl = SLTracker(state, sheets)
-    engine = TradeEngine(state, sl, sheets)
-    order_handler = OrderHandler("Béla teszt", sl, PositionMode.HEDGE)
+    sl = SLTracker(state, journal)
+    engine = TradeEngine(state, sl, journal)
+    orders = OrderHandler("Béla teszt", sl, PositionMode.HEDGE)
 
-    # open SHORT (Sell, closed=0) — WS omits positionIdx → should infer 2
-    f_open = parse_fill_ws(fill("Sell", 0.22, 1961.88, closed=0.0, idx=0,
-                                exec_id="x1", order_id="ord1"), PositionMode.HEDGE)
-    check("open fill inferred idx=2 (hedge short)", f_open.position_idx == 2)
+    f_open = parse_fill_ws(fill("Sell", 0.22, 1961.88, idx=0, exec_id="x1", order_id="o1"),
+                           PositionMode.HEDGE)
+    check("open fill idx=2 (hedge short)", f_open.position_idx == 2)
     await engine.on_open_fill(f_open)
-    trade_id = next(iter(state.open_trades))
-    check("trade created", len(state.open_trades) == 1)
-    check("trade is PENDING", state.open_trades[trade_id].status == TradeStatus.PENDING)
+    await settle()
+    check("no OPEN posted before SL", len(fake.posts) == 0)
 
-    # SL order arrives (order side Buy → protects Sell/short position, idx 2)
-    await order_handler.handle([{
-        "stopOrderType": "StopLoss", "side": "Buy", "symbol": "ETHUSDT",
-        "positionIdx": "0", "triggerPrice": "1966.52", "updatedTime": "1100",
-        "orderId": "slord",
-    }])
-    tr = state.open_trades[trade_id]
-    check("SL assigned", tr.sl_price == 1966.52)
-    check("trade ACTIVE after SL", tr.status == TradeStatus.ACTIVE)
+    await orders.handle([{"stopOrderType": "StopLoss", "side": "Buy", "symbol": "ETHUSDT",
+                          "positionIdx": "0", "triggerPrice": "1966.52",
+                          "updatedTime": "1100", "orderId": "sl1"}])
+    await settle()
+    open_posts = [p for p in fake.posts if p["is_closing"] == "No"]
+    check("OPEN posted after SL", len(open_posts) == 1)
+    check("OPEN has SL", open_posts and open_posts[0]["stop_loss"] == 1966.52)
+    check("OPEN direction SELL", open_posts and open_posts[0]["direction"] == "SELL")
+    check("OPEN source bybit", open_posts and open_posts[0]["source"] == "bybit")
 
-    # close SHORT: Buy fill with closed>0 → should infer idx=2 and match the trade
+    tid = next(iter(state.open_trades))
     f_close = parse_fill_ws(fill("Buy", 0.22, 1955.0, closed=0.22, idx=0,
-                                 exec_id="x2", order_id="ord2", t=2000),
-                            PositionMode.HEDGE)
-    check("close fill inferred idx=2 (closes short)", f_close.position_idx == 2)
+                                 exec_id="x2", order_id="o2", t=_NOW + 1000), PositionMode.HEDGE)
+    check("close fill idx=2 (closes short)", f_close.position_idx == 2)
     await engine.on_close_fill(f_close)
-    check("trade CLOSED", tr.status == TradeStatus.CLOSED)
-    check("PnL computed", tr.pnl is not None and tr.pnl > 0)
-    check("RR computed", tr.rr_ratio is not None)
+    await settle()
+    close_posts = [p for p in fake.posts if p["is_closing"] == "Yes"]
+    check("CLOSE posted", len(close_posts) == 1)
+    check("CLOSE direction inverted BUY", close_posts and close_posts[0]["direction"] == "BUY")
+    check("CLOSE has PnL in comment", close_posts and "PnL=" in close_posts[0]["comment"])
+    check("trade CLOSED", state.open_trades[tid].status == TradeStatus.CLOSED)
+    check("exactly one OPEN + one CLOSE", len(fake.posts) == 2)
+    await journal.stop()
 
-    # let the flush loop write
-    await asyncio.sleep(0.1)
-    await sheets.stop()
-
-    has_open = any(r[9] == "No" and r[11] == trade_id for r in client.rows) or \
-        any(r[9] == "No" for r in client.updates.values())
-    has_close = any(r[9] == "Yes" and r[11] == trade_id for r in client.rows)
-    check("OPEN row written", has_open)
-    check("CLOSE row written", has_close)
-
-    close_row = next(r for r in client.rows if r[9] == "Yes")
-    check("CLOSE direction inverted (BUY)", close_row[3] == "BUY")
-    check("CLOSE comment has PnL", "PnL=" in close_row[13])
-    check("Platform=Bybit", close_row[14] == "Bybit")
-
-    # ── Scenario: one-way long, no SL within grace → INVALID flagged in sheet
-    client2 = FakeClient()
-    sheets2 = SheetsSync(client2)
-    await sheets2.start()
+    # ── Scenario B: no SL within grace → INVALID open posted with SL=0 ───────
+    constants.SL_GRACE_PERIOD_MS = 50
+    fake2 = FakeDoPost()
+    journal2 = Journal(fake2)
+    await journal2.start()
     state2 = AccountState("Capri11", PositionMode.ONE_WAY)
-    sl2 = SLTracker(state2, sheets2)
-    engine2 = TradeEngine(state2, sl2, sheets2)
-    import constants
-    constants.SL_GRACE_PERIOD_MS = 50  # speed up
-    f = parse_fill_ws(fill("Buy", 1.0, 2000.0, idx=0, exec_id="y1", order_id="oy1"),
-                      PositionMode.ONE_WAY)
-    f.exec_time_ms = 0  # force grace already in the past relative to wall clock... use timer
+    sl2 = SLTracker(state2, journal2)
+    engine2 = TradeEngine(state2, sl2, journal2)
     await engine2.on_open_fill(parse_fill_ws(
-        fill("Buy", 1.0, 2000.0, idx=0, exec_id="y1", order_id="oy1"),
-        PositionMode.ONE_WAY))
+        fill("Buy", 1.0, 2000.0, idx=0, exec_id="y1", order_id="oy1"), PositionMode.ONE_WAY))
     tid2 = next(iter(state2.open_trades))
     state2.open_trades[tid2].grace_deadline_ms = 1  # already expired
     sl2.start_grace_timer(state2.open_trades[tid2])
     await asyncio.sleep(0.1)
-    check("no-SL trade marked INVALID", state2.open_trades[tid2].status == TradeStatus.INVALID)
-    await sheets2.stop()
-    open_row = next((r for r in client2.rows if r[9] == "No"), None)
-    check("INVALID open row has HIBA note",
-          open_row is not None and "HIBA! Nincs SL" in open_row[13])
+    check("no-SL trade INVALID", state2.open_trades[tid2].status == TradeStatus.INVALID)
+    inv = [p for p in fake2.posts if p["is_closing"] == "No"]
+    check("INVALID OPEN posted", len(inv) == 1)
+    check("INVALID OPEN stop_loss=0", inv and inv[0]["stop_loss"] == 0)
+    await journal2.stop()
 
     print("\n" + ("ALL PASSED" if not failures else f"FAILURES: {failures}"))
     return 1 if failures else 0

@@ -15,7 +15,7 @@ from constants import TradeStatus, ExitType, SL_GRACE_PERIOD_MS, QTY_TOLERANCE
 
 if TYPE_CHECKING:
     from sl_tracker import SLTracker
-    from sheets_sync import SheetsSync
+    from journal import Journal
 
 log = logging.getLogger(__name__)
 
@@ -35,10 +35,10 @@ def _exit_type(fill: Fill) -> ExitType:
 
 
 class TradeEngine:
-    def __init__(self, state: AccountState, sl_tracker: "SLTracker", sheets: "SheetsSync"):
+    def __init__(self, state: AccountState, sl_tracker: "SLTracker", journal: "Journal"):
         self.state = state
         self.sl = sl_tracker
-        self.sheets = sheets
+        self.journal = journal
         self._order_to_trade: dict[str, str] = {}
 
     # ── open ────────────────────────────────────────────────────────────────
@@ -60,7 +60,6 @@ class TradeEngine:
             trade.entry_fee += fill.exec_fee * (open_qty / fill.exec_qty) if fill.exec_qty else 0
             trade.grace_deadline_ms = fill.exec_time_ms + SL_GRACE_PERIOD_MS
             trade.updated_at_ms = now
-            await self.sheets.enqueue_update(trade)
             return
 
         trade_id = f"{self.state.account_name}_{fill.symbol}_{fill.side}_{fill.order_id[:12]}"
@@ -86,8 +85,8 @@ class TradeEngine:
         self._order_to_trade[fill.order_id] = trade_id
         log.info(f"[{self.state.account_name}] New trade {trade_id}: "
                  f"{fill.side} {open_qty} {fill.symbol} @ {fill.exec_price}")
+        # OPEN is posted later — when SL resolves (ACTIVE) or grace expires (INVALID).
         self.sl.register_pending_trade(trade)
-        await self.sheets.enqueue_open(trade)
 
     # ── close ───────────────────────────────────────────────────────────────
     async def on_close_fill(self, fill: Fill):
@@ -133,12 +132,11 @@ class TradeEngine:
             if abs(trade.exit_qty - trade.entry_qty) < QTY_TOLERANCE:
                 trade.exit_qty = trade.entry_qty
                 self._finalize(trade)
-                await self.sheets.enqueue_close(trade)
+                await self.journal.post_close(trade)
                 self._schedule_removal(trade.trade_id)
             else:
                 log.info(f"[{self.state.account_name}] Partial close {trade.trade_id}: "
                          f"{portion}, remaining {trade.remaining_qty}")
-                await self.sheets.enqueue_update(trade)
 
         if remaining > QTY_TOLERANCE:
             log.warning(f"[{self.state.account_name}] Unmatched exit qty {remaining} "

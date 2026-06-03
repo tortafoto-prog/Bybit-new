@@ -132,6 +132,14 @@ class RecoveryEngine:
         # 6. resolve leftover PENDING + validate live ───────────────────────
         await self._resolve_pending()
         await self.validate_current_positions()
+
+        # 7. journal still-open trades whose SL status is settled. Closed trades
+        #    were already posted via post_close; doPost dedups by Ticket ID, so
+        #    re-posting already-journaled trades is a harmless no-op.
+        for trade in list(self.state.open_trades.values()):
+            if trade.status in (TradeStatus.ACTIVE, TradeStatus.INVALID) and not trade.close_posted:
+                await self.engine.journal.post_open(trade)
+
         log.info(f"[{self.state.account_name}] Recovery complete")
 
     # ── conditional collection ──────────────────────────────────────────────
@@ -239,7 +247,7 @@ class RecoveryEngine:
                 trade.status = TradeStatus.INVALID
                 trade.updated_at_ms = now
                 self._remove_pending(trade)
-                await self.engine.sheets.enqueue_update(trade)
+                await self.engine.journal.post_open(trade)
             else:
                 self.sl.start_grace_timer(trade)
 

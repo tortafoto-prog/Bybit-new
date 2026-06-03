@@ -17,15 +17,15 @@ from models import AccountState, SLEvent, TPEvent, PositionKey, InternalTrade
 from constants import TradeStatus, SL_GRACE_PERIOD_MS, SL_UNMATCHED_BUFFER_TTL_MS
 
 if TYPE_CHECKING:
-    from sheets_sync import SheetsSync
+    from journal import Journal
 
 log = logging.getLogger(__name__)
 
 
 class SLTracker:
-    def __init__(self, state: AccountState, sheets: "SheetsSync"):
+    def __init__(self, state: AccountState, journal: "Journal"):
         self.state = state
-        self.sheets = sheets
+        self.journal = journal
         self._grace_tasks: dict[str, asyncio.Task] = {}
         self._buffer_tasks: dict[tuple[str, PositionKey], asyncio.Task] = {}
 
@@ -70,7 +70,8 @@ class SLTracker:
         self._cancel_grace(trade.trade_id)
         log.info(f"[{self.state.account_name}] SL {ev.sl_price} → {trade.trade_id} "
                  f"(entry={trade.entry_price})")
-        await self.sheets.enqueue_update(trade)
+        # SL is final → journal the OPEN now (with SL).
+        await self.journal.post_open(trade)
 
     # ── TP ──────────────────────────────────────────────────────────────────
     async def on_tp_change(self, ev: TPEvent):
@@ -104,7 +105,7 @@ class SLTracker:
         trade.updated_at_ms = int(time.time() * 1000)
         self._pop(pending, key, "tp")
         log.info(f"[{self.state.account_name}] TP {ev.tp_price} → {trade.trade_id}")
-        await self.sheets.enqueue_update(trade)
+        # TP is captured in the OPEN payload when it is posted (on SL-resolve).
 
     # ── trade registration ──────────────────────────────────────────────────
     def register_pending_trade(self, trade: InternalTrade):
@@ -154,7 +155,8 @@ class SLTracker:
             if not pending:
                 self.state.pending_sl_queue.pop(trade.pos_key, None)
         log.warning(f"[{self.state.account_name}] {trade_id} INVALID: no SL in grace period")
-        await self.sheets.enqueue_update(trade)
+        # Grace expired with no SL → journal the OPEN now (web app flags it HIBA!).
+        await self.journal.post_open(trade)
 
     def _cancel_grace(self, trade_id: str):
         task = self._grace_tasks.pop(trade_id, None)

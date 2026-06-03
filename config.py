@@ -1,14 +1,14 @@
-"""Configuration loading from environment variables.
+"""Configuration from environment variables.
 
-Accounts only need name/api_key/api_secret. The environment (mainnet/demo/
-testnet) and position mode are auto-detected at startup, so the user never has
-to specify them. Optional overrides are still honored if present.
+The bot now writes through the shared Apps Script doPost web app (the single
+authoritative writer that also serves cTrader/Capital), so it no longer needs
+Google credentials or a sheet id — only the web-app URL and the shared secret.
 """
 
 import json
 import os
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 log = logging.getLogger(__name__)
@@ -20,34 +20,28 @@ class AccountConfig:
     api_key: str
     api_secret: str
     category: str = "linear"
-    # Optional explicit overrides (None = auto-detect)
     force_env: Optional[str] = None      # "mainnet" | "demo" | "testnet"
     force_mode: Optional[str] = None     # "OneWay" | "Hedge"
 
 
 @dataclass
-class SheetsConfig:
-    credentials_json: dict
-    sheet_id: str
-    sheet_name: str = "Trades"
+class DoPostConfig:
+    url: str
+    secret: str
 
 
 @dataclass
 class AppConfig:
     accounts: list[AccountConfig]
-    sheets: SheetsConfig
+    dopost: DoPostConfig
     log_level: str = "INFO"
 
 
-def _field(acc: dict, *keys: str, required: bool = True) -> Optional[str]:
+def _field(acc: dict, *keys: str) -> str:
     for key in keys:
         if key in acc and acc[key] not in (None, ""):
             return acc[key]
-    if required:
-        raise KeyError(
-            f"Missing required field. Tried {keys}. Got keys: {list(acc.keys())}"
-        )
-    return None
+    raise KeyError(f"Missing required field. Tried {keys}. Got keys: {list(acc.keys())}")
 
 
 def load_config() -> AppConfig:
@@ -73,24 +67,14 @@ def load_config() -> AppConfig:
         except KeyError as e:
             raise ValueError(f"Account #{i + 1} config error: {e}")
 
-    creds_raw = os.getenv("GOOGLE_CREDS_JSON") or os.getenv("GOOGLE_CREDENTIALS", "{}")
-    try:
-        creds_json = json.loads(creds_raw)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid Google credentials JSON: {e}")
-
-    sheet_id = os.getenv("SHEET_ID", "")
-    if not sheet_id:
-        raise ValueError("SHEET_ID environment variable is required")
-
-    sheets = SheetsConfig(
-        credentials_json=creds_json,
-        sheet_id=sheet_id,
-        sheet_name=os.getenv("SHEET_NAME", "Trades"),
-    )
+    url = os.getenv("DOPOST_URL", "")
+    if not url:
+        raise ValueError("DOPOST_URL environment variable is required "
+                         "(the Apps Script web-app deployment URL)")
+    secret = os.getenv("DOPOST_SECRET", "dsbfb@dfshds3434")
 
     return AppConfig(
         accounts=accounts,
-        sheets=sheets,
+        dopost=DoPostConfig(url=url, secret=secret),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
     )

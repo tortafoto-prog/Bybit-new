@@ -12,8 +12,8 @@ load_dotenv()
 from config import load_config
 from constants import PositionMode
 from bybit_rest import BybitREST
-from sheets_client import SheetsClient
-from sheets_sync import SheetsSync
+from dopost_client import DoPostClient
+from journal import Journal
 from account import AccountManager
 
 log = logging.getLogger("bybit_journal")
@@ -33,16 +33,10 @@ async def main():
     setup_logging(config.log_level)
     log.info(f"Starting Bybit Trade Journal with {len(config.accounts)} accounts")
 
-    sheets_client = SheetsClient(
-        credentials_json=config.sheets.credentials_json,
-        sheet_id=config.sheets.sheet_id, sheet_name=config.sheets.sheet_name)
-    await sheets_client.connect()
-    if not sheets_client.can_write:
-        log.error("Sheets is not writable — journaling will not work until the service "
-                  "account has Editor access. Continuing for diagnostics only.")
-
-    sheets_sync = SheetsSync(sheets_client)
-    await sheets_sync.start()
+    dopost = DoPostClient(url=config.dopost.url, secret=config.dopost.secret)
+    journal = Journal(dopost)
+    await journal.start()
+    log.info(f"Journaling via doPost web app: {config.dopost.url}")
 
     # dedup account names
     seen, accounts = set(), []
@@ -65,7 +59,7 @@ async def main():
             continue
         mode = PositionMode(acc.force_mode) if acc.force_mode else PositionMode(mode_str)
         log.info(f"[{acc.name}] Environment: {env}, Position mode: {mode.value}")
-        managers.append(AccountManager(acc, rest, env, mode, sheets_sync))
+        managers.append(AccountManager(acc, rest, env, mode, journal))
 
     log.info(f"Starting with {len(managers)} valid account(s)")
 
@@ -93,7 +87,7 @@ async def main():
     log.info("Shutting down...")
     for m in managers:
         await m.stop()
-    await sheets_sync.stop()
+    await journal.stop()
     for t in tasks:
         t.cancel()
     log.info("Shutdown complete")
